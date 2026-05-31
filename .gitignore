@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+arise_memory.json
+firebase_credentials.json
+HACKING TOOLS/
+hack_menu.py
