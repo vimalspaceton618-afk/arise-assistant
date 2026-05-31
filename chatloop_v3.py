@@ -3,6 +3,7 @@ import json
 import math
 import operator
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ Identity:
 - You are more than a basic chatbot: you can reason, plan, remember useful facts,
   use local deterministic tools, and keep long conversations organized.
 - You are precise, practical, and direct.
+- You can support enterprise cyber defense, incident response, governance, and
+  safe threat modeling inside a strict review-only sandbox.
 
 Behavior:
 - Ask a clarifying question only when the task is truly ambiguous.
@@ -29,6 +32,8 @@ Behavior:
 - Never invent facts. If you do not know, say so and explain what would verify it.
 - Do not provide malware, credential theft, phishing, DDoS, keylogging, or other
   offensive cyber instructions.
+- Do not execute or recommend destructive production actions without backups,
+  dry-runs, rollback planning, scoped authorization, and human approval.
 """.strip()
 
 
@@ -65,6 +70,272 @@ SAFE_CONSTANTS = {
 
 class ToolError(ValueError):
     pass
+
+
+@dataclass
+class SafetyAssessment:
+    verdict: str
+    category: str
+    risk_score: int
+    reasons: List[str] = field(default_factory=list)
+    safeguards: List[str] = field(default_factory=list)
+
+    def format(self) -> str:
+        lines = [
+            f"Verdict: {self.verdict}",
+            f"Category: {self.category}",
+            f"Risk score: {self.risk_score}/10",
+        ]
+        if self.reasons:
+            lines.append("Reasons:")
+            lines.extend(f"- {reason}" for reason in self.reasons)
+        if self.safeguards:
+            lines.append("Required safeguards:")
+            lines.extend(f"- {safeguard}" for safeguard in self.safeguards)
+        return "\n".join(lines)
+
+
+@dataclass
+class CyberSafetyLayer:
+    audit_path: Path
+    sandbox_mode: str = "review_only"
+    require_approval: bool = True
+
+    @classmethod
+    def from_env(cls) -> "CyberSafetyLayer":
+        return cls(
+            audit_path=Path(os.getenv("ARISE_AUDIT_LOG", "arise_audit.jsonl")),
+            sandbox_mode=os.getenv("ARISE_SANDBOX_MODE", "review_only"),
+            require_approval=os.getenv("ARISE_REQUIRE_APPROVAL", "true").lower() == "true",
+        )
+
+    def is_cyber_related(self, text: str) -> bool:
+        lowered = text.lower()
+        keywords = [
+            "attack",
+            "audit",
+            "breach",
+            "cve",
+            "cyber",
+            "defend",
+            "defense",
+            "delete database",
+            "drop database",
+            "exploit",
+            "firewall",
+            "incident",
+            "malware",
+            "nmap",
+            "phishing",
+            "ransomware",
+            "sandbox",
+            "secret",
+            "siem",
+            "soc",
+            "threat",
+            "vulnerability",
+        ]
+        return any(keyword in lowered for keyword in keywords)
+
+    def assess(self, text: str, strict_action: bool = False) -> SafetyAssessment:
+        lowered = text.lower()
+        defensive_context = self.has_defensive_context(lowered) and not strict_action
+
+        blocked_checks = [
+            (r"\b(ddos|botnet|flood)\b", "DDoS or traffic flooding request"),
+            (r"\b(phishing kit|credential theft|steal password|steal token)\b", "Credential theft or phishing enablement"),
+            (r"\b(keylogger|ransomware|malware|persistence|backdoor)\b", "Malware or persistence request"),
+            (r"\b(exfiltrate|dump credentials|dump tokens|bypass mfa)\b", "Data exfiltration or access bypass request"),
+            (r"\b(sqlmap|metasploit|exploit)\b.*\b(public|external|internet|target)\b", "Offensive exploitation against external targets"),
+        ]
+        destructive_checks = [
+            (r"\brm\s+(-[a-z]*r[a-z]*f|-rf|-fr)\b", "Recursive force delete"),
+            (r"\b(drop|truncate)\s+(database|schema|table)\b", "Destructive database mutation"),
+            (r"\bdelete\s+from\b.*\bwhere\b\s*(1\s*=\s*1|true)\b", "Broad SQL delete"),
+            (r"\bterraform\s+destroy\b", "Infrastructure destroy operation"),
+            (r"\bkubectl\s+delete\b", "Kubernetes delete operation"),
+            (r"\baws\b.*\bdelete-|\baz\b.*\bdelete\b|\bgcloud\b.*\bdelete\b", "Cloud delete operation"),
+            (r"\bformat\b.*\b(drive|disk|volume)\b", "Disk format operation"),
+        ]
+        approval_checks = [
+            (r"\bnmap\b|\bmasscan\b|\bport scan\b", "Network scanning needs written authorization and scope"),
+            (r"\bvulnerability scan\b|\bpentest\b|\bred team\b", "Security testing needs approved scope"),
+            (r"\bchange firewall\b|\biptables\b|\bsecurity group\b", "Network control change can cause outage"),
+            (r"\bmigrate database\b|\balter table\b|\brestart service\b", "Production operation needs rollback planning"),
+            (r"\bansible-playbook\b|\bterraform apply\b|\bkubectl apply\b", "Automation can change many systems"),
+        ]
+
+        reasons = self.match_reasons(lowered, blocked_checks)
+        if reasons and not defensive_context:
+            return SafetyAssessment(
+                verdict="blocked",
+                category="offensive_or_abusive_cyber",
+                risk_score=10,
+                reasons=reasons,
+                safeguards=[
+                    "Use ARISE for authorized defense, detection, hardening, and incident response only.",
+                    "Reframe the request as a safe defensive analysis or recovery task.",
+                ],
+            )
+
+        destructive_reasons = self.match_reasons(lowered, destructive_checks)
+        if destructive_reasons and "dry-run" not in lowered and "--dry-run" not in lowered:
+            verdict = "blocked" if strict_action or not defensive_context else "allowed"
+            return SafetyAssessment(
+                verdict=verdict,
+                category="destructive_operation",
+                risk_score=9 if verdict == "blocked" else 4,
+                reasons=destructive_reasons,
+                safeguards=[
+                    "Require backup or snapshot verification before any mutation.",
+                    "Use dry-run or read-only preview first.",
+                    "Require explicit human approval with target, environment, rollback, and blast radius.",
+                    "Block production execution from the AI session.",
+                ],
+            )
+
+        approval_reasons = self.match_reasons(lowered, approval_checks)
+        if approval_reasons:
+            return SafetyAssessment(
+                verdict="approval_required" if self.require_approval else "allowed",
+                category="enterprise_security_operation",
+                risk_score=7,
+                reasons=approval_reasons,
+                safeguards=[
+                    "Confirm written authorization and exact scope.",
+                    "Prefer read-only mode, rate limits, and maintenance windows.",
+                    "Log the action, expected impact, and rollback plan.",
+                    "Run in a lab or staging environment before production.",
+                ],
+            )
+
+        if self.is_cyber_related(text):
+            return SafetyAssessment(
+                verdict="allowed",
+                category="defensive_cyber_intelligence",
+                risk_score=2,
+                reasons=["Request appears defensive, educational, or governance-focused."],
+                safeguards=[
+                    "Keep outputs focused on prevention, detection, response, and recovery.",
+                    "Do not include exploit automation, stealth, persistence, or credential theft steps.",
+                ],
+            )
+
+        return SafetyAssessment(
+            verdict="allowed",
+            category="general",
+            risk_score=1,
+            reasons=["No cyber or destructive operation risk detected."],
+            safeguards=[],
+        )
+
+    def guard_action(self, action: str) -> str:
+        assessment = self.assess(action, strict_action=True)
+        self.audit("guard_action", action, assessment)
+        return assessment.format()
+
+    def classify_request(self, request: str) -> str:
+        assessment = self.assess(request)
+        self.audit("classify_request", request, assessment)
+        return assessment.format()
+
+    def incident_plan(self, scenario: str) -> str:
+        lowered = scenario.lower()
+        if "database" in lowered or "delete" in lowered or "drop" in lowered:
+            focus = [
+                "Freeze write access for affected systems.",
+                "Identify last known-good backup, snapshot, or point-in-time recovery target.",
+                "Export current logs before rotation removes evidence.",
+                "Restore into staging first, validate integrity, then plan production recovery.",
+                "Add guardrails: least privilege, change tickets, dry-run migrations, and delete protection.",
+            ]
+        elif "ransomware" in lowered or "malware" in lowered:
+            focus = [
+                "Isolate affected hosts from the network.",
+                "Preserve volatile evidence and collect endpoint telemetry.",
+                "Block known indicators across EDR, DNS, email, and firewall controls.",
+                "Restore from clean backups after root-cause validation.",
+                "Rotate credentials exposed on affected hosts.",
+            ]
+        elif "phishing" in lowered or "credential" in lowered:
+            focus = [
+                "Disable suspicious sessions and rotate affected credentials.",
+                "Search mailboxes and logs for related indicators.",
+                "Block sender infrastructure, URLs, and attachment hashes.",
+                "Review MFA events and impossible-travel signals.",
+                "Notify affected users with clear reporting steps.",
+            ]
+        else:
+            focus = [
+                "Triage severity, affected assets, and business impact.",
+                "Contain the incident before eradication.",
+                "Preserve logs and evidence with timestamps.",
+                "Recover through tested rollback or restore procedures.",
+                "Document lessons learned and control improvements.",
+            ]
+        assessment = self.assess(scenario)
+        self.audit("incident_plan", scenario, assessment)
+        return "Incident response plan:\n" + "\n".join(f"{index}. {step}" for index, step in enumerate(focus, start=1))
+
+    def policy_context(self) -> str:
+        return "\n".join(
+            [
+                "Cyber sandbox policy:",
+                f"- Mode: {self.sandbox_mode}",
+                f"- Human approval required: {self.require_approval}",
+                "- Block offensive automation, credential theft, malware, DDoS, and destructive production actions.",
+                "- Prefer read-only analysis, dry-runs, backups, rollback plans, scoped authorization, and audit logging.",
+                "- Treat attacker thinking as high-level threat modeling for defense, not execution guidance.",
+            ]
+        )
+
+    def status(self) -> str:
+        return "\n".join(
+            [
+                f"Sandbox mode: {self.sandbox_mode}",
+                f"Human approval required: {self.require_approval}",
+                f"Audit log: {self.audit_path}",
+            ]
+        )
+
+    def audit(self, event_type: str, text: str, assessment: SafetyAssessment) -> None:
+        event = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event_type": event_type,
+            "verdict": assessment.verdict,
+            "category": assessment.category,
+            "risk_score": assessment.risk_score,
+            "text_preview": text[:240],
+        }
+        try:
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError:
+            pass
+
+    def has_defensive_context(self, lowered: str) -> bool:
+        defensive_terms = [
+            "analyze",
+            "audit",
+            "defend",
+            "defense",
+            "detect",
+            "harden",
+            "incident",
+            "monitor",
+            "prevent",
+            "recover",
+            "restore",
+            "review",
+            "sandbox",
+            "secure",
+            "simulate",
+            "threat model",
+        ]
+        return any(term in lowered for term in defensive_terms)
+
+    def match_reasons(self, lowered: str, checks: List[tuple[str, str]]) -> List[str]:
+        return [reason for pattern, reason in checks if re.search(pattern, lowered)]
 
 
 @dataclass
@@ -366,6 +637,7 @@ class AriseAgent:
     router: ModelRouter = field(init=False)
     conversation: List[Dict[str, str]] = field(default_factory=list, init=False)
     memory: LocalMemory = field(init=False)
+    cyber_safety: CyberSafetyLayer = field(init=False)
 
     def __post_init__(self) -> None:
         load_dotenv()
@@ -377,6 +649,7 @@ class AriseAgent:
         memory_path = Path(os.getenv("ARISE_MEMORY_FILE", "arise_memory.json"))
         self.memory = LocalMemory(memory_path)
         self.memory.load()
+        self.cyber_safety = CyberSafetyLayer.from_env()
 
         self.router = ModelRouter.from_env()
         if not self.router.profiles:
@@ -417,10 +690,20 @@ class AriseAgent:
         if command_reply is not None:
             return command_reply
 
+        safety_assessment = self.cyber_safety.assess(user_input)
+        if safety_assessment.verdict == "blocked":
+            self.cyber_safety.audit("blocked_prompt", user_input, safety_assessment)
+            return (
+                safety_assessment.format()
+                + "\n\nARISE can help reframe this into authorized defense, detection, recovery, or hardening."
+            )
+
         tool_context = self.auto_tool_context(user_input)
         prompt = user_input
         if tool_context:
             prompt = f"{user_input}\n\nLocal tool context:\n{tool_context}"
+        if safety_assessment.verdict == "approval_required":
+            prompt = f"{prompt}\n\nSafety gate:\n{safety_assessment.format()}"
 
         self.conversation.append({"role": "user", "content": prompt})
         self.trim_history()
@@ -479,6 +762,20 @@ class AriseAgent:
                 if not rest:
                     return "Use: /plan your goal"
                 return self.make_plan(rest)
+            if command == "/guard":
+                if not rest:
+                    return "Use: /guard command-or-action"
+                return self.cyber_safety.guard_action(rest)
+            if command == "/cyber":
+                if not rest:
+                    return "Use: /cyber request-to-classify"
+                return self.cyber_safety.classify_request(rest)
+            if command == "/incident":
+                if not rest:
+                    return "Use: /incident scenario"
+                return self.cyber_safety.incident_plan(rest)
+            if command == "/sandbox":
+                return self.cyber_safety.status()
             if command == "/models":
                 return self.router.list_models()
             if command == "/model":
@@ -505,6 +802,9 @@ class AriseAgent:
     def auto_tool_context(self, text: str) -> str:
         lowered = text.lower()
         blocks = [f"Saved memory:\n{self.memory.context()}"]
+
+        if self.cyber_safety.is_cyber_related(text):
+            blocks.append(self.cyber_safety.policy_context())
 
         if any(word in lowered for word in ["time", "date", "today"]):
             blocks.append(f"Local datetime: {datetime.now().isoformat(timespec='seconds')}")
@@ -575,6 +875,7 @@ class AriseAgent:
                 f"Temperature: {self.temperature}",
                 f"Free-only routing: {self.router.free_only}",
                 f"Configured routes: {len(self.router.profiles)}",
+                self.cyber_safety.status(),
                 f"Memory file: {self.memory.path}",
                 f"Saved memories: {len(self.memory.data)}",
                 f"History messages: {len(self.conversation) - 1}",
@@ -593,6 +894,10 @@ class AriseAgent:
                 "/forget key - delete one memory",
                 "/calc expression - run a safe calculator",
                 "/plan goal - create an execution plan",
+                "/guard action - review a risky command/action before use",
+                "/cyber request - classify a cyber request safely",
+                "/incident scenario - create a defensive response checklist",
+                "/sandbox - show cyber sandbox status",
                 "/models - list configured model routes",
                 "/model provider:model - switch active model",
                 "/route prompt - preview routing for a prompt",

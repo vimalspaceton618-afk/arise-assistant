@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 arise_memory.json
+arise_audit.jsonl
 firebase_credentials.json
 HACKING TOOLS/
 hack_menu.py
